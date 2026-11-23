@@ -759,12 +759,19 @@ async function pullText(){
 async function pushText(force){
   if(!configured()) return;
   await ghReady();
-  if(!force && !textSha) { /* 首次也推 */ }
+  if(!textSha){
+    const f=await getFile(cfg.path);
+    if(!f.notModified && !f.missing){ textSha=f.sha; textEtag=f.etag; }
+  }
   textSha = await putFile(cfg.path, snapshot(), textSha);
 }
 async function pushPhotos(){
   if(!photoDirty || !configured()) return;
   await ghReady();
+  if(!photoSha){
+    const f=await getFile(photoPath());
+    if(!f.notModified && !f.missing){ photoSha=f.sha; photoEtag=f.etag; }
+  }
   const map={};
   activeEntries().forEach(e=>{ if((e.photos||[]).length) map[e.id]=e.photos; });
   photoSha = await putFile(photoPath(), {ts:nowTs(), map}, photoSha);
