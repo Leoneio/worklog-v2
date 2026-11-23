@@ -231,10 +231,15 @@ td.op .link{margin-right:10px}
       <div class="field">
         <label>现场照片</label>
         <div class="photo-list" id="edPhotos"></div>
-        <div style="margin-top:8px">
+        <div style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
           <input type="file" id="edFile" accept="image/*" multiple hidden>
           <button class="btn" id="edPick">选择照片</button>
-          <span class="hint" style="display:inline">图片会自动压缩，单张建议不超过 3MB</span>
+          <select id="edQuality" style="max-width:150px">
+            <option value="original">原图不压缩</option>
+            <option value="high">高清（推荐）</option>
+            <option value="std">标准（省空间）</option>
+          </select>
+          <span class="hint" style="display:inline" id="edQualityHint">高清：长边 2400px，画质 92%</span>
         </div>
       </div>
       <div class="field"><label>备注</label><textarea id="edNote" placeholder="补充说明（可选）"></textarea></div>
@@ -518,6 +523,9 @@ function openEdit(id){
   renderTypeFilters();
   document.getElementById('edType').value = e? (e.type||types[0]?.name||'其他') : (types[0]?.name||'其他');
   editPhotos = e? (e.photos||[]).slice() : [];
+  const qsel=document.getElementById('edQuality');
+  qsel.value=photoMode;
+  qsel.onchange();
   renderEditPhotos();
   show('editMask');
 }
@@ -553,24 +561,32 @@ function delEntry(id){
   saveEntries(); render(); scheduleSync();
 }
 
-/* ============ 图片压缩 ============ */
-function compress(file){
+/* ============ 图片处理：三档画质 ============ */
+const QUALITY = {original:{edge:0,q:1}, high:{edge:2400,q:0.92}, std:{edge:1600,q:0.82}};
+let photoMode = (localStorage.getItem('wl2_photomode')||'high');
+function compress(file, mode){
+  mode = mode || 'high';
   return new Promise((resolve,reject)=>{
     const fr=new FileReader();
-    fr.onload=()=>{
-      const img=new Image();
-      img.onload=()=>{
-        const max=1100;
-        let w=img.width,h=img.height;
-        if(w>max||h>max){ const r=Math.min(max/w,max/h); w=Math.round(w*r); h=Math.round(h*r); }
-        const c=document.createElement('canvas'); c.width=w; c.height=h;
-        c.getContext('2d').drawImage(img,0,0,w,h);
-        resolve(c.toDataURL('image/jpeg',0.75));
-      };
-      img.onerror=reject;
-      img.src=fr.result;
-    };
     fr.onerror=reject;
+    fr.onload=()=>{
+      const raw=fr.result;
+      if(mode==='original'){ resolve(raw); return; }
+      const conf=QUALITY[mode]||QUALITY.high;
+      const img=new Image();
+      img.onerror=()=>reject(new Error('图片解析失败'));
+      img.onload=()=>{
+        let w=img.naturalWidth||img.width, h=img.naturalHeight||img.height;
+        if(w>conf.edge || h>conf.edge){ const r=Math.min(conf.edge/w, conf.edge/h); w=Math.round(w*r); h=Math.round(h*r); }
+        const c=document.createElement('canvas'); c.width=w; c.height=h;
+        const ctx=c.getContext('2d');
+        if(ctx.imageSmoothingQuality) ctx.imageSmoothingQuality='high';
+        ctx.drawImage(img,0,0,w,h);
+        const png = (file.type==='image/png' && file.size < 3*1024*1024);   /* 截图保留 PNG，字更清晰 */
+        resolve(png? c.toDataURL('image/png') : c.toDataURL('image/jpeg', conf.q));
+      };
+      img.src=raw;
+    };
     fr.readAsDataURL(file);
   });
 }
@@ -649,6 +665,7 @@ function doExport(){
 /* ============ 同步 ============ */
 let syncBusy=false, pollTimer=null, pushTimer=null;
 let textEtag=null, textSha=null, photoEtag=null, photoSha=null, photoDirty=false;
+function setDirty(){ photoDirty=true; }
 
 function setStatus(kind, text){
   const chip=document.getElementById('syncChip'), dot=document.getElementById('syncDot');
@@ -941,10 +958,18 @@ document.getElementById('editX').onclick=()=>hide('editMask');
 document.getElementById('edCancel').onclick=()=>hide('editMask');
 document.getElementById('edSave').onclick=saveEntry;
 document.getElementById('edPick').onclick=()=>document.getElementById('edFile').click();
+document.getElementById('edQuality').onchange=()=>{
+  photoMode=document.getElementById('edQuality').value;
+  try{ localStorage.setItem('wl2_photomode', photoMode); }catch(e){}
+  const hint=document.getElementById('edQualityHint');
+  hint.textContent = photoMode==='original'? '原图不处理，清晰度最高，云端体积最大'
+    : photoMode==='high'? '高清：长边 2400px，画质 92%'
+    : '标准：长边 1600px，画质 82%';
+};
 document.getElementById('edFile').onchange=async e=>{
   const files=Array.from(e.target.files||[]);
   for(const f of files){
-    try{ editPhotos.push(await compress(f)); renderEditPhotos(); }catch(err){ alert('图片读取失败：'+f.name); }
+    try{ editPhotos.push(await compress(f, photoMode)); renderEditPhotos(); setDirty(); }catch(err){ alert('图片读取失败：'+f.name); }
   }
   e.target.value='';
 };
