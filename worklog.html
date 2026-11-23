@@ -384,7 +384,7 @@ function weekOf(d){ try{ return WEEK[new Date(d+'T00:00:00').getDay()]; }catch(e
 
 /* ============ 存储 ============ */
 function loadJSON(k, def){ try{ const r=localStorage.getItem(k); return r? JSON.parse(r): def; }catch(e){ return def; } }
-function saveEntries(){ try{ localStorage.setItem(LSK.entries, JSON.stringify(entries.map(function(e){ var c=Object.assign({}, e); c.photos=[]; return c; }))); }catch(e){} }
+function saveEntries(){ try{ localStorage.setItem(LSK.entries, JSON.stringify(entries.map(function(e){ var c=Object.assign({}, e); c.photos=[]; c.thumbs=[]; return c; }))); }catch(e){} }
 function saveTypes(){ try{ localStorage.setItem(LSK.types, JSON.stringify(types)); }catch(e){} }
 
 function defaultTypes(){
@@ -446,7 +446,7 @@ function renderTable(){
   document.getElementById('cntTab').textContent = '(' + list.length + ')';
   document.getElementById('emptyBox').hidden = list.length>0;
   tb.innerHTML = list.map(e=>{
-    const photos=(e.photos||[]);
+    const photos=dispPhotos(e);
     const thumbs = photos.length? '<div class="thumbs">'+photos.slice(0,4).map((p,i)=>`<img class="thumb" src="${p}" data-lb="${i}" data-id="${e.id}" alt="">`).join('')+(photos.length>4?`<span class="no" style="align-self:center">+${photos.length-4}</span>`:'')+'</div>' : '<span class="no">—</span>';
     return `<tr>
       <td class="col-time">
@@ -473,7 +473,7 @@ function renderTable(){
 function renderGallery(){
   const items=[];
   activeEntries().slice().sort((a,b)=>(b.date||'').localeCompare(a.date||'')).forEach(e=>{
-    (e.photos||[]).forEach((p,i)=>items.push({e,p,i}));
+    dispPhotos(e).forEach((p,i)=>items.push({e,p,i}));
   });
   document.getElementById('cntGal').textContent='('+items.length+')';
   document.getElementById('galEmpty').hidden = items.length>0;
@@ -490,10 +490,11 @@ function render(){ renderYears(); renderTypeFilters(); renderTable(); renderGall
 
 /* ============ 详情 / 预览 ============ */
 function entryById(id){ return entries.find(e=>e.id===id); }
+function dispPhotos(e){ return (e && e.thumbs && e.thumbs.length)? e.thumbs : ((e&&e.photos)||[]); }
 function openDetail(id){
   const e=entryById(id); if(!e) return;
   document.getElementById('dtTitle').textContent = e.title || '活动详情';
-  const photos=(e.photos||[]);
+  const photos=dispPhotos(e);
   document.getElementById('dtBody').innerHTML = `
     <div class="kv">
       <div class="k">活动时间</div><div>${esc(fmtDate(e.date))} ${esc(weekOf(e.date))}${e.slot? ' · '+esc(e.slot):''}</div>
@@ -503,7 +504,7 @@ function openDetail(id){
       <div class="k">备注</div><div>${esc(e.note||'—')}</div>
     </div>
     <div class="field"><label>通讯稿原件</label><div class="art">${esc(e.article || '（未填写通讯稿）')}</div></div>
-    ${photos.length? `<div class="field"><label>现场照片（${photos.length} 张）</label><div class="photo-list">${photos.map(p=>`<img src="${p}" data-lb="0" style="width:132px;height:132px;object-fit:cover;border-radius:8px;border:1px solid #e3e9f2;cursor:zoom-in" data-full="${p}" alt="">`).join('')}</div></div>`:''}
+    ${photos.length? `<div class="field"><label>现场照片（${photos.length} 张）</label><div class="photo-list">${photos.map((p,i)=>`<img src="${p}" data-idx="${i}" data-lb="0" style="width:132px;height:132px;object-fit:cover;border-radius:8px;border:1px solid #e3e9f2;cursor:zoom-in" data-full="${p}" alt="">`).join('')}</div></div>`:''}
   `;
   document.getElementById('dtBody').dataset.id = id;
   show('detailMask');
@@ -513,7 +514,7 @@ function openDetail(id){
 async function openEdit(id){
   editingId = id || null;
   const e = id? entryById(id) : null;
-  if(e && (e.phs||[]).length && (e.photos||[]).length !== (e.phs||[]).length){ await loadEntryPhotos(e); render(); }
+  if(e && (e.phs||[]).length && (e.photos||[]).length !== (e.phs||[]).length){ await loadEntryPhotos(e, true); render(); }
   document.getElementById('editTitle').textContent = e? '编辑记录' : '新增记录';
   document.getElementById('edDate').value = e? (e.date||'') : new Date().toISOString().slice(0,10);
   document.getElementById('edSlot').value = e? (e.slot||'') : '';
@@ -534,7 +535,7 @@ async function openEdit(id){
 function renderEditPhotos(){
   document.getElementById('edPhotos').innerHTML = editPhotos.map((p,i)=>`<div class="item"><img src="${p}" alt=""><button class="del" data-pdel="${i}">×</button></div>`).join('');
 }
-function saveEntry(){
+async function saveEntry(){
   const title=document.getElementById('edTitle').value.trim();
   const date=document.getElementById('edDate').value;
   if(!title){ alert('请填写活动名称'); return; }
@@ -554,7 +555,11 @@ function saveEntry(){
   }else{
     entries.push(Object.assign({id:uid()}, data)); target=entries[entries.length-1];
   }
-  if(target){ target.phs=(target.photos||[]).map(extOfDataURL); markDirty(target.id); }
+  if(target){
+    target.phs=(target.photos||[]).map(extOfDataURL);
+    try{ target.thumbs=await Promise.all((target.photos||[]).map(makeThumbUrl)); }catch(err){ target.thumbs=[]; }
+    markDirty(target.id);
+  }
   saveEntries(); render(); scheduleSync();
   hide('editMask');
 }
@@ -683,10 +688,17 @@ function ghHeaders(){
   return {'Authorization':'token '+cfg.token, 'Accept':'application/vnd.github+json', 'Content-Type':'application/json'};
 }
 async function gh(path, opts){
-  const res=await fetch(apiBase()+path, Object.assign({headers:ghHeaders()}, opts||{}));
-  const text=await res.text();
-  let data=null; try{ data=text? JSON.parse(text):null; }catch(e){}
-  return {ok:res.ok, status:res.status, data, text, etag:res.headers.get('ETag')};
+  const o=Object.assign({}, opts||{});
+  o.headers=o.headers||ghHeaders();
+  const ctrl=new AbortController();
+  const to=setTimeout(function(){ ctrl.abort(); }, 25000);
+  o.signal=ctrl.signal;
+  try{
+    const res=await fetch(apiBase()+path, o);
+    const text=await res.text();
+    let data=null; try{ data=text? JSON.parse(text):null; }catch(e){}
+    return {ok:res.ok, status:res.status, data, text, etag:res.headers.get('ETag')};
+  }finally{ clearTimeout(to); }
 }
 async function ghReady(){
   if(!cfg.owner){
@@ -731,18 +743,45 @@ async function putFile(name, obj, sha, tries){
   }
   throw new Error('写入 '+name+' 失败：'+(r.data&&r.data.message||r.status));
 }
-/* ---------- 照片：每个项目一个独立文件夹 photos/<id>/1.jpg ---------- */
+/* ---------- 照片：每个项目一个文件夹 photos/<id>/1.jpg（+ 1t.jpeg 缩略图） ---------- */
 function extOfDataURL(d){ const m=/^data:image\/([a-z0-9.+-]+);/i.exec(d||''); return m? m[1].toLowerCase() : 'jpeg'; }
 function contentsUrl(name){ return '/repos/'+cfg.owner+'/'+encodeURIComponent(cfg.repo)+'/contents/'+String(name).split('/').map(encodeURIComponent).join('/'); }
 function photoName(id, idx, ext){ return 'photos/'+id+'/'+(idx+1)+'.'+ext; }
+function thumbName(id, idx){ return 'photos/'+id+'/'+(idx+1)+'t.jpeg'; }
+function makeThumbUrl(d){
+  return new Promise(function(res){
+    try{
+      const img=new Image();
+      img.onload=function(){
+        try{
+          const E=460; let w=img.naturalWidth||img.width, h=img.naturalHeight||img.height;
+          if(w>E || h>E){ const r=E/Math.max(w,h); w=Math.round(w*r); h=Math.round(h*r); }
+          const c=document.createElement('canvas'); c.width=w; c.height=h;
+          c.getContext('2d').drawImage(img,0,0,w,h);
+          res(c.toDataURL('image/jpeg',0.62));
+        }catch(e){ res(d); }
+      };
+      img.onerror=function(){ res(d); };
+      img.src=d;
+    }catch(e){ res(d); }
+  });
+}
 async function getRaw(name){
   if(!cfg.owner) await ghReady();
   const url=contentsUrl(name)+'?ref='+encodeURIComponent(cfg.branch||'main');
   const r=await gh(url, {headers:ghHeaders()});
   if(r.status===304) return {notModified:true, etag:r.etag};
   if(r.status===404) return {missing:true};
-  if(!r.ok) throw new Error('读取 '+name+' 失败：'+((r.data&&r.data.message)||r.status));
-  return {sha:r.data.sha, content:String(r.data.content||'').replace(/\s/g,''), etag:r.etag};
+  if(!r.ok) throw new Error('读取 '+name+' 失败：'+(r.data&&r.data.message||r.status));
+  let content=String(r.data&&r.data.content||'').replace(/\s/g,'');
+  if(!content || (r.data&&r.data.encoding==='none')){
+    const sha=r.data&&r.data.sha;
+    if(!sha) throw new Error('读取 '+name+' 失败：缺少文件指纹');
+    const bb=await gh('/repos/'+cfg.owner+'/'+encodeURIComponent(cfg.repo)+'/git/blobs/'+sha, {headers:ghHeaders()});
+    if(!bb.ok || !bb.data || !bb.data.content) throw new Error('读取 '+name+' 失败：'+((bb.data&&bb.data.message)||bb.status));
+    content=String(bb.data.content).replace(/\s/g,'');
+  }
+  return {sha:r.data&&r.data.sha, content, etag:r.etag};
 }
 async function putRaw(name, base64, sha){
   const body={message:'sync '+name+' '+new Date().toISOString(), content:base64, branch:cfg.branch||'main'};
@@ -750,7 +789,7 @@ async function putRaw(name, base64, sha){
   const r=await gh(contentsUrl(name), {method:'PUT', body:JSON.stringify(body)});
   if(r.ok) return r.data.content.sha;
   if(r.status===409 || r.status===422){
-    const g=await getRaw(name);
+    const g=await getFileFresh(name);
     return putRaw(name, base64, g.missing? null : g.sha);
   }
   throw new Error('上传 '+name+' 失败：'+((r.data&&r.data.message)||r.status));
@@ -769,39 +808,60 @@ async function deleteRaw(name, sha){
 let dirtyEntries = new Set();
 function markDirty(id){ dirtyEntries.add(id); photoDirty=true; }
 
-/* 把某个项目的照片写进它自己的文件夹，并清掉不再需要的旧文件 */
+/* 上传：每个项目一个文件夹，整图 + 缩略图各存一份 */
 async function syncEntryPhotos(e){
   const want = e.deleted? [] : (e.photos||[]).map(extOfDataURL);
   const old = (e.phs||[]).slice();
-  for(let i=0;i<old.length;i++){
-    if(i<want.length && old[i]===want[i]) continue;
-    try{
-      const g=await getRaw(photoName(e.id,i,old[i]));
-      if(!g.missing) await deleteRaw(photoName(e.id,i,old[i]), g.sha);
-    }catch(err){}
+  for(let i=old.length-1;i>=0;i--){
+    if(!e.deleted && i<want.length && old[i]===want[i]) continue;
+    try{ const g=await getRaw(photoName(e.id,i,old[i])); if(!g.missing) await deleteRaw(photoName(e.id,i,old[i]), g.sha); }catch(err){}
+    try{ const g2=await getRaw(thumbName(e.id,i)); if(!g2.missing) await deleteRaw(thumbName(e.id,i), g2.sha); }catch(err){}
   }
   for(let i=0;i<want.length;i++){
     const b64=String(e.photos[i]||'').split(',')[1]||'';
     if(!b64) continue;
     await putRaw(photoName(e.id,i,want[i]), b64);
+    try{
+      const t=e.thumbs&&e.thumbs[i]? e.thumbs[i] : await makeThumbUrl(e.photos[i]);
+      const tb=String(t||'').split(',')[1]||'';
+      if(tb) await putRaw(thumbName(e.id,i), tb);
+    }catch(err){}
   }
   e.phs = want;
 }
 
-/* 从文件夹把照片读回来（只在需要时读） */
-async function loadEntryPhotos(e){
+/* 读取：默认只读缩略图（快），编辑/看大图时才读整图 */
+async function loadEntryPhotos(e, full){
+  window.__dbg.push('load '+e.id+' full='+!!full);
   const phs=(e.phs||[]).slice();
-  if(!phs.length){ e.photos=[]; return; }
-  const out=[];
+  if(!phs.length){ e.photos=[]; e.thumbs=[]; return; }
+  const arr=[], typ=[], fixes=[];
   for(let i=0;i<phs.length;i++){
     try{
-      const f=await getRaw(photoName(e.id,i,phs[i]));
-      out.push(f.missing? null : ('data:image/'+phs[i]+';base64,'+f.content));
-    }catch(err){ out.push(null); }
+      let f= full? {missing:true} : await getRaw(thumbName(e.id,i));
+      let t= full? phs[i] : 'jpeg';
+      if(full || f.missing){ f=await getRaw(photoName(e.id,i,phs[i])); t=phs[i]; if(!full && f.content) fixes.push(i); }
+      if(f.missing || !f.content){ arr.push(null); typ.push(t); continue; }
+      arr.push('data:image/'+t+';base64,'+f.content); typ.push(t);
+    }catch(err){ lastPhotoErr=err.message; arr.push(null); typ.push('jpeg'); }
   }
-  e.photos=out.filter(Boolean);
+  if(full){ e.photos=arr.filter(Boolean); }
+  else{
+    e.thumbs=arr.filter(Boolean);
+    if(fixes.length){
+      setTimeout(function(){
+        fixes.forEach(async function(i){
+          try{
+            const src=arr[i]; if(!src) return;
+            const th=await makeThumbUrl(src);
+            await putRaw(thumbName(e.id,i), String(th).split(',')[1]||'');
+          }catch(err){}
+        });
+      }, 500);
+    }
+  }
 }
-
+let lastPhotoErr=''; window.__dbg=window.__dbg||[];
 function snapshot(){
   return {
     ts:nowTs(),
@@ -832,7 +892,7 @@ function mergeRemote(remote){
         entries.push({id:r.id, date:r.date, slot:r.slot||'', title:r.title||'', type:r.type||'其他', place:r.place||'',
           summary:r.summary||'', article:r.article||'', note:r.note||'', photos:[], phs:remotePhs.slice(),
           updatedAt:r.updatedAt||0, deleted:false});
-        changed=true; if(remotePhs.length) needIds.push(r.id);
+        changed=true; window.__dbg.push('new '+r.id+' phs='+remotePhs.length); if(remotePhs.length) needIds.push(r.id);
       }
       return;
     }
@@ -841,7 +901,7 @@ function mergeRemote(remote){
       local.place=r.place||''; local.summary=r.summary||''; local.article=r.article||''; local.note=r.note||'';
       local.updatedAt=r.updatedAt||0; local.deleted=!!r.deleted;
       const same = JSON.stringify(remotePhs)===JSON.stringify(local.phs||[]) && (local.photos||[]).length>=remotePhs.length;
-      if(!same){ local.phs=remotePhs.slice(); local.photos=[]; if(remotePhs.length) needIds.push(r.id); }
+      if(!same){ local.phs=remotePhs.slice(); local.photos=[]; local.thumbs=[]; if(remotePhs.length) needIds.push(r.id); }
       changed=true;
     }
   });
@@ -856,11 +916,12 @@ async function pullText(){
   if(f.missing){ await pushText(true); return; }
   textSha=f.sha; textEtag=f.etag;
   const res=mergeRemote(f.json||{});
-  if(res.changed) render();
+  window.__dbg.push('pull changed='+res.changed+' need='+res.needIds.length);
+  if(res.changed){ try{ render(); }catch(err){ lastPhotoErr='render:'+err.message; window.__dbg.push('render ERR '+err.message); } }
   if(res.needIds.length){
     for(const id of res.needIds){
       const e=entryById(id);
-      if(e){ await loadEntryPhotos(e); }
+      if(e){ try{ await loadEntryPhotos(e); }catch(err){ lastPhotoErr='load:'+err.message; } } else { window.__dbg.push('miss '+id); }
     }
     render();
   }
@@ -925,6 +986,7 @@ function startPoll(){
     try{
       await pullText();
       if(dirtyEntries.size) await pushPhotos();
+      if(entries.some(function(e){ return !e.deleted && (e.phs||[]).length && (e.thumbs||[]).length < (e.phs||[]).length; })){ await loadMissingPhotos(); }
       setStatus('ok','已同步 · '+new Date().toLocaleTimeString());
     }catch(err){ setStatus('err', err.message); }
     syncBusy=false;
@@ -934,7 +996,7 @@ function stopPoll(){ if(pollTimer){ clearInterval(pollTimer); pollTimer=null; } 
 /* 本机已有 phs 但照片没加载（重启页面后）时补加载 */
 async function loadMissingPhotos(){
   for(const e of activeEntries()){
-    if((e.phs||[]).length && (e.photos||[]).length < (e.phs||[]).length){
+    if((e.phs||[]).length && (e.thumbs||[]).length < (e.phs||[]).length){
       try{ await loadEntryPhotos(e); }catch(err){}
     }
   }
@@ -989,7 +1051,24 @@ function enterApp(r){
   document.getElementById('syncChip').classList.toggle('show', r!=='admin');
   hide('loginMask');
   try{ localStorage.setItem(LSK.auth, JSON.stringify({role:r, exp:nowTs()+7*24*3600*1000})); }catch(e){}
+  healPhotos();
   initSync();
+  setTimeout(healPhotos, 2500);
+}
+/* 老记录的照片只存在本机时，补传进各自文件夹 */
+function healPhotos(){
+  let marked=false;
+  entries.forEach(function(e){
+    if(e.deleted) return;
+    const local=(e.photos||[]).length;
+    const known=(e.phs||[]).length;
+    if(local > known){
+      e.phs=(e.photos||[]).map(extOfDataURL);
+      markDirty(e.id);
+      marked=true;
+    }
+  });
+  if(marked){ scheduleSync(); }
 }
 function tryRestore(){
   const a=loadJSON(LSK.auth, null);
@@ -1096,7 +1175,15 @@ document.getElementById('dtCopy').onclick=async()=>{
   catch(e){ alert('复制失败，请手动选择文本复制'); }
 };
 document.getElementById('dtBody').addEventListener('click', e=>{
-  if(e.target.dataset.full){ document.getElementById('lbImg').src=e.target.dataset.full; document.getElementById('lightbox').classList.add('show'); }
+  if(e.target.dataset.full){
+    const id=document.getElementById('dtBody').dataset.id; const en=entryById(id); const idx=+(e.target.dataset.idx||0);
+    (async()=>{
+      let src=e.target.dataset.full;
+      if(en && (en.phs||[]).length && (en.photos||[]).length !== (en.phs||[]).length){ try{ await loadEntryPhotos(en, true); src=(en.photos||[])[idx] || src; openDetail(id); }catch(err){} }
+      else if(en && (en.photos||[])[idx]) src=en.photos[idx];
+      document.getElementById('lbImg').src=src; document.getElementById('lightbox').classList.add('show');
+    })();
+  }
 });
 
 document.getElementById('tyX').onclick=()=>hide('typeMask');
