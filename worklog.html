@@ -384,7 +384,7 @@ function weekOf(d){ try{ return WEEK[new Date(d+'T00:00:00').getDay()]; }catch(e
 
 /* ============ 存储 ============ */
 function loadJSON(k, def){ try{ const r=localStorage.getItem(k); return r? JSON.parse(r): def; }catch(e){ return def; } }
-function saveEntries(){ try{ localStorage.setItem(LSK.entries, JSON.stringify(entries)); }catch(e){} }
+function saveEntries(){ try{ localStorage.setItem(LSK.entries, JSON.stringify(entries.map(function(e){ var c=Object.assign({}, e); c.photos=[]; return c; }))); }catch(e){} }
 function saveTypes(){ try{ localStorage.setItem(LSK.types, JSON.stringify(types)); }catch(e){} }
 
 function defaultTypes(){
@@ -396,7 +396,8 @@ function ensureOther(){ if(!types.some(t=>t.name==='其他')) types.push({name:'
 function hashPw(s){ let h=5381; for(let i=0;i<s.length;i++){ h=((h<<5)+h+s.charCodeAt(i))>>>0; } return 'h'+h.toString(36); }
 function defaultAccounts(){ return {admin:{user:'admin', pw:hashPw('Admin@123')}, user:{user:'user', pw:hashPw('User@123')}}; }
 let accounts = Object.assign(defaultAccounts(), loadJSON(LSK.acc, {}));
-function saveAccounts(){ try{ localStorage.setItem(LSK.acc, JSON.stringify(accounts)); }catch(e){} }
+function persistAccounts(){ try{ localStorage.setItem(LSK.acc, JSON.stringify(accounts)); }catch(e){} }
+function saveAccounts(){ accounts.at=nowTs(); persistAccounts(); }
 
 /* ============ 同步配置 ============ */
 const DEFAULT_CFG = {provider:'github', token:'', repo:'worklog-data2', path:'worklog.json', apiBase:'', auto:true, owner:'', branch:'', lastAt:0};
@@ -509,9 +510,10 @@ function openDetail(id){
 }
 
 /* ============ 新增 / 编辑 ============ */
-function openEdit(id){
+async function openEdit(id){
   editingId = id || null;
   const e = id? entryById(id) : null;
+  if(e && (e.phs||[]).length && (e.photos||[]).length !== (e.phs||[]).length){ await loadEntryPhotos(e); render(); }
   document.getElementById('editTitle').textContent = e? '编辑记录' : '新增记录';
   document.getElementById('edDate').value = e? (e.date||'') : new Date().toISOString().slice(0,10);
   document.getElementById('edSlot').value = e? (e.slot||'') : '';
@@ -546,18 +548,20 @@ function saveEntry(){
     note:document.getElementById('edNote').value.trim(),
     photos:editPhotos.slice(), updatedAt:nowTs(), deleted:false
   };
+  let target=null;
   if(editingId){
-    const e=entryById(editingId); if(e) Object.assign(e, data);
+    const e=entryById(editingId); if(e){ Object.assign(e, data); target=e; }
   }else{
-    entries.push(Object.assign({id:uid()}, data));
+    entries.push(Object.assign({id:uid()}, data)); target=entries[entries.length-1];
   }
+  if(target){ target.phs=(target.photos||[]).map(extOfDataURL); markDirty(target.id); }
   saveEntries(); render(); scheduleSync();
   hide('editMask');
 }
 function delEntry(id){
   const e=entryById(id); if(!e) return;
   if(!confirm('确定删除「' + (e.title||'这条记录') + '」？删除会在所有设备同步。')) return;
-  e.deleted=true; e.updatedAt=nowTs();
+  e.deleted=true; e.updatedAt=nowTs(); markDirty(e.id);
   saveEntries(); render(); scheduleSync();
 }
 
@@ -708,59 +712,141 @@ async function getFile(name){
   if(!r.ok) throw new Error('读取 '+name+' 失败：'+(r.data&&r.data.message||r.status));
   return {sha:r.data.sha, json:JSON.parse(unb64(r.data.content)), etag:r.etag};
 }
-async function putFile(name, obj, sha){
+async function getFileFresh(name){
+  const p='/repos/'+cfg.owner+'/'+encodeURIComponent(cfg.repo)+'/contents/'+encodeURIComponent(name)+'?ref='+encodeURIComponent(cfg.branch||'main');
+  const r=await gh(p, {headers:ghHeaders()});
+  if(r.status===404) return {missing:true};
+  if(!r.ok) throw new Error('读取 '+name+' 失败：'+(r.data&&r.data.message||r.status));
+  return {sha:r.data.sha, etag:r.etag};
+}
+async function putFile(name, obj, sha, tries){
+  tries = tries||0;
   const body={message:'sync '+name+' '+new Date().toISOString(), content:b64(JSON.stringify(obj)), branch:cfg.branch||'main'};
   if(sha) body.sha=sha;
   const r=await gh('/repos/'+cfg.owner+'/'+encodeURIComponent(cfg.repo)+'/contents/'+encodeURIComponent(name), {method:'PUT', body:JSON.stringify(body)});
   if(r.ok) return r.data.content.sha;
-  if(r.status===409 || r.status===422){
-    const again=await getFile(name);
-    if(again.missing) return putFile(name, obj, null);
-    return putFile(name, obj, again.sha);
+  if((r.status===409 || r.status===422) && tries<3){
+    const again=await getFileFresh(name);
+    return putFile(name, obj, again.missing? null : again.sha, tries+1);
   }
   throw new Error('写入 '+name+' 失败：'+(r.data&&r.data.message||r.status));
 }
+/* ---------- 照片：每个项目一个独立文件夹 photos/<id>/1.jpg ---------- */
+function extOfDataURL(d){ const m=/^data:image\/([a-z0-9.+-]+);/i.exec(d||''); return m? m[1].toLowerCase() : 'jpeg'; }
+function contentsUrl(name){ return '/repos/'+cfg.owner+'/'+encodeURIComponent(cfg.repo)+'/contents/'+String(name).split('/').map(encodeURIComponent).join('/'); }
+function photoName(id, idx, ext){ return 'photos/'+id+'/'+(idx+1)+'.'+ext; }
+async function getRaw(name){
+  if(!cfg.owner) await ghReady();
+  const url=contentsUrl(name)+'?ref='+encodeURIComponent(cfg.branch||'main');
+  const r=await gh(url, {headers:ghHeaders()});
+  if(r.status===304) return {notModified:true, etag:r.etag};
+  if(r.status===404) return {missing:true};
+  if(!r.ok) throw new Error('读取 '+name+' 失败：'+((r.data&&r.data.message)||r.status));
+  return {sha:r.data.sha, content:String(r.data.content||'').replace(/\s/g,''), etag:r.etag};
+}
+async function putRaw(name, base64, sha){
+  const body={message:'sync '+name+' '+new Date().toISOString(), content:base64, branch:cfg.branch||'main'};
+  if(sha) body.sha=sha;
+  const r=await gh(contentsUrl(name), {method:'PUT', body:JSON.stringify(body)});
+  if(r.ok) return r.data.content.sha;
+  if(r.status===409 || r.status===422){
+    const g=await getRaw(name);
+    return putRaw(name, base64, g.missing? null : g.sha);
+  }
+  throw new Error('上传 '+name+' 失败：'+((r.data&&r.data.message)||r.status));
+}
+async function deleteRaw(name, sha){
+  const body={message:'delete '+name, sha:sha, branch:cfg.branch||'main'};
+  const r=await gh(contentsUrl(name), {method:'DELETE', body:JSON.stringify(body)});
+  if(r.ok || r.status===404) return true;
+  if(r.status===409 || r.status===422){
+    const g=await getRaw(name);
+    if(g.missing) return true;
+    return deleteRaw(name, g.sha);
+  }
+  return false;
+}
+let dirtyEntries = new Set();
+function markDirty(id){ dirtyEntries.add(id); photoDirty=true; }
+
+/* 把某个项目的照片写进它自己的文件夹，并清掉不再需要的旧文件 */
+async function syncEntryPhotos(e){
+  const want = e.deleted? [] : (e.photos||[]).map(extOfDataURL);
+  const old = (e.phs||[]).slice();
+  for(let i=0;i<old.length;i++){
+    if(i<want.length && old[i]===want[i]) continue;
+    try{
+      const g=await getRaw(photoName(e.id,i,old[i]));
+      if(!g.missing) await deleteRaw(photoName(e.id,i,old[i]), g.sha);
+    }catch(err){}
+  }
+  for(let i=0;i<want.length;i++){
+    const b64=String(e.photos[i]||'').split(',')[1]||'';
+    if(!b64) continue;
+    await putRaw(photoName(e.id,i,want[i]), b64);
+  }
+  e.phs = want;
+}
+
+/* 从文件夹把照片读回来（只在需要时读） */
+async function loadEntryPhotos(e){
+  const phs=(e.phs||[]).slice();
+  if(!phs.length){ e.photos=[]; return; }
+  const out=[];
+  for(let i=0;i<phs.length;i++){
+    try{
+      const f=await getRaw(photoName(e.id,i,phs[i]));
+      out.push(f.missing? null : ('data:image/'+phs[i]+';base64,'+f.content));
+    }catch(err){ out.push(null); }
+  }
+  e.photos=out.filter(Boolean);
+}
+
 function snapshot(){
-  return {ts:nowTs(), types:types.map(t=>({name:t.name,color:t.color})),
-    entries:activeEntries().concat(entries.filter(e=>e.deleted)).map(e=>({
+  return {
+    ts:nowTs(),
+    types: types.map(t=>({name:t.name,color:t.color})),
+    accounts: {admin:{user:accounts.admin.user, pw:accounts.admin.pw}, user:{user:accounts.user.user, pw:accounts.user.pw}, at:(accounts.at||0)},
+    entries: activeEntries().concat(entries.filter(e=>e.deleted)).map(e=>({
       id:e.id, date:e.date, slot:e.slot||'', title:e.title||'', type:e.type||'', place:e.place||'',
-      summary:e.summary||'', article:e.article||'', note:e.note||'', ph:(e.photos||[]).length,
-      updatedAt:e.updatedAt||0, deleted:!!e.deleted }))};
+      summary:e.summary||'', article:e.article||'', note:e.note||'',
+      phs:(e.phs||[]), ph:(e.phs||[]).length,
+      updatedAt:e.updatedAt||0, deleted:!!e.deleted }))
+  };
 }
 function mergeRemote(remote){
-  let changed=false, needPhotos=false;
+  let changed=false; const needIds=[];
   (remote.types||[]).forEach(t=>{ if(t&&t.name && !types.some(x=>x.name===t.name)){ types.push({name:t.name,color:t.color||'#5d6d7e'}); changed=true; } });
   ensureOther();
+  if(remote.accounts && (remote.accounts.at||0) > (accounts.at||0)){
+    if(remote.accounts.admin && remote.accounts.admin.user) accounts.admin=remote.accounts.admin;
+    if(remote.accounts.user && remote.accounts.user.user) accounts.user=remote.accounts.user;
+    accounts.at=remote.accounts.at||0;
+    persistAccounts();
+  }
   (remote.entries||[]).forEach(r=>{
+    const remotePhs = Array.isArray(r.phs)? r.phs : [];
     const local=entries.find(x=>x.id===r.id);
     if(!local){
       if(!r.deleted){
         entries.push({id:r.id, date:r.date, slot:r.slot||'', title:r.title||'', type:r.type||'其他', place:r.place||'',
-          summary:r.summary||'', article:r.article||'', note:r.note||'', photos:[], updatedAt:r.updatedAt||0, deleted:false});
-        changed=true; if((r.ph||0)>0) needPhotos=true;
+          summary:r.summary||'', article:r.article||'', note:r.note||'', photos:[], phs:remotePhs.slice(),
+          updatedAt:r.updatedAt||0, deleted:false});
+        changed=true; if(remotePhs.length) needIds.push(r.id);
       }
       return;
     }
     if((r.updatedAt||0) > (local.updatedAt||0)){
-      const ph=(r.ph!=null? r.ph : local.photos.length);
       local.date=r.date; local.slot=r.slot||''; local.title=r.title||''; local.type=r.type||'其他';
       local.place=r.place||''; local.summary=r.summary||''; local.article=r.article||''; local.note=r.note||'';
       local.updatedAt=r.updatedAt||0; local.deleted=!!r.deleted;
-      if(ph!==local.photos.length){ local.photos=[]; if(ph>0) needPhotos=true; }
+      const same = JSON.stringify(remotePhs)===JSON.stringify(local.phs||[]) && (local.photos||[]).length>=remotePhs.length;
+      if(!same){ local.phs=remotePhs.slice(); local.photos=[]; if(remotePhs.length) needIds.push(r.id); }
       changed=true;
     }
   });
   if(changed){ saveTypes(); saveEntries(); }
-  return {changed, needPhotos};
-}
-async function pullPhotos(){
-  const name=photoPath();
-  const f=await getFile(name);
-  if(f.notModified || f.missing){ if(f.missing){ photoSha=null; } return; }
-  photoSha=f.sha; photoEtag=f.etag;
-  const map=(f.json&&f.json.map)||{};
-  entries.forEach(e=>{ if(map[e.id]) e.photos=map[e.id].slice(); });
-  saveEntries(); render();
+  return {changed, needIds};
 }
 async function pullText(){
   if(!configured()) return;
@@ -769,9 +855,15 @@ async function pullText(){
   if(f.notModified) return;
   if(f.missing){ await pushText(true); return; }
   textSha=f.sha; textEtag=f.etag;
-  const {changed, needPhotos} = mergeRemote(f.json||{});
-  if(changed) render();
-  if(needPhotos) await pullPhotos();
+  const res=mergeRemote(f.json||{});
+  if(res.changed) render();
+  if(res.needIds.length){
+    for(const id of res.needIds){
+      const e=entryById(id);
+      if(e){ await loadEntryPhotos(e); }
+    }
+    render();
+  }
 }
 async function pushText(force){
   if(!configured()) return;
@@ -783,24 +875,29 @@ async function pushText(force){
   textSha = await putFile(cfg.path, snapshot(), textSha);
 }
 async function pushPhotos(){
-  if(!photoDirty || !configured()) return;
+  if(!configured()) return;
+  if(!dirtyEntries.size){ photoDirty=false; return; }
   await ghReady();
-  if(!photoSha){
-    const f=await getFile(photoPath());
-    if(!f.notModified && !f.missing){ photoSha=f.sha; photoEtag=f.etag; }
+  for(const id of Array.from(dirtyEntries)){
+    const e=entryById(id);
+    if(!e){ dirtyEntries.delete(id); continue; }
+    await syncEntryPhotos(e);
+    dirtyEntries.delete(id);
   }
-  const map={};
-  activeEntries().forEach(e=>{ if((e.photos||[]).length) map[e.id]=e.photos; });
-  photoSha = await putFile(photoPath(), {ts:nowTs(), map}, photoSha);
   photoDirty=false;
+  saveEntries();
 }
 function scheduleSync(){
   photoDirty=true;
   if(!configured() || !cfg.auto) { setStatus('', '未配置或未开启自动同步'); return; }
   clearTimeout(pushTimer);
   pushTimer=setTimeout(async ()=>{
-    try{ setStatus('busy','正在上传…'); await pushText(); await pushPhotos(); setStatus('ok','已同步 · '+new Date().toLocaleTimeString()); }
-    catch(err){ setStatus('err', err.message); }
+    try{
+      setStatus('busy','正在上传…');
+      await pushPhotos();
+      await pushText(true);
+      setStatus('ok','已同步 · '+new Date().toLocaleTimeString());
+    }catch(err){ setStatus('err', err.message); }
   }, 320);
 }
 async function syncNow(quiet){
@@ -810,8 +907,9 @@ async function syncNow(quiet){
   try{
     if(!quiet) setStatus('busy','正在同步…');
     await pullText();
-    await pushText(true);
     await pushPhotos();
+    await pushText(true);
+    await loadMissingPhotos();
     cfg.lastAt=nowTs(); saveCfg();
     setStatus('ok','已同步 · '+new Date().toLocaleTimeString());
     render();
@@ -826,13 +924,22 @@ function startPoll(){
     syncBusy=true;
     try{
       await pullText();
-      if(photoDirty) await pushPhotos();
+      if(dirtyEntries.size) await pushPhotos();
       setStatus('ok','已同步 · '+new Date().toLocaleTimeString());
     }catch(err){ setStatus('err', err.message); }
     syncBusy=false;
   }, 600);
 }
 function stopPoll(){ if(pollTimer){ clearInterval(pollTimer); pollTimer=null; } }
+/* 本机已有 phs 但照片没加载（重启页面后）时补加载 */
+async function loadMissingPhotos(){
+  for(const e of activeEntries()){
+    if((e.phs||[]).length && (e.photos||[]).length < (e.phs||[]).length){
+      try{ await loadEntryPhotos(e); }catch(err){}
+    }
+  }
+  render();
+}
 
 /* 站点同目录 sync-config.json：一处改 Token，所有设备生效 */
 async function loadRemoteConfig(){
@@ -1024,7 +1131,7 @@ document.getElementById('acSave').onclick=()=>{
   if(uu) accounts.user.user=uu;
   if(ap) accounts.admin.pw=hashPw(ap);
   if(up) accounts.user.pw=hashPw(up);
-  saveAccounts(); hide('accMask'); alert('账号已保存（仅本机生效）');
+  saveAccounts(); hide('accMask'); scheduleSync(); alert('账号已保存，稍等几秒会自动同步到云端，其他设备刷新后即可用同样账号登录');
 };
 
 document.getElementById('lbX').onclick=()=>document.getElementById('lightbox').classList.remove('show');
@@ -1032,6 +1139,23 @@ document.getElementById('lightbox').onclick=e=>{ if(e.target.id==='lightbox') e.
 document.querySelectorAll('.mask').forEach(m=>{
   m.addEventListener('click', e=>{ if(e.target===m && m.id!=='loginMask') m.classList.remove('show'); });
 });
+
+/* 登录前先拉一次云端账号：本机改过的账号密码，其他设备一打开就能用 */
+async function prefetchAccounts(){
+  if(!configured()) return;
+  try{
+    await ghReady();
+    const f=await getFile(cfg.path);
+    if(!f || f.notModified || f.missing) return;
+    const ac=f.json && f.json.accounts;
+    if(ac && (ac.at||0) > (accounts.at||0)){
+      if(ac.admin && ac.admin.user) accounts.admin=ac.admin;
+      if(ac.user && ac.user.user) accounts.user=ac.user;
+      accounts.at=ac.at||0;
+      persistAccounts();
+    }
+  }catch(err){}
+}
 
 /* ============ 启动 ============ */
 (function init(){
@@ -1043,6 +1167,7 @@ document.querySelectorAll('.mask').forEach(m=>{
   if(!tryRestore()){
     document.getElementById('loginMask').classList.add('show');
   }
+  setTimeout(function(){ prefetchAccounts(); }, 300);
 })();
 </script>
 </body>
