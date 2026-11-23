@@ -835,6 +835,16 @@ async function initSync(){
   if(configured() && cfg.auto) startPoll();
 }
 
+/* 链接一键配置：worklog.html#token=xxx 打开即生效（改 Token 后把新链接发到各设备一次即可） */
+(function parseHashToken(){
+  const raw=location.hash.replace(/^#/,'');
+  if(!raw) return;
+  let p=null; try{ p=new URLSearchParams(raw); }catch(e){ return; }
+  const t=p.get('token')||p.get('t');
+  if(t){ cfg.token=t; cfg.owner=''; cfg.branch=''; saveCfg();
+    try{ history.replaceState(null,'',location.pathname+location.search); }catch(e){} }
+})();
+
 /* ============ 登录 ============ */
 function enterApp(r){
   role=r;
