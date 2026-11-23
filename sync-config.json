@@ -1,0 +1,7 @@
+{
+  "provider": "github",
+  "token": "",
+  "repo": "worklog-data2",
+  "path": "worklog.json",
+  "auto": true
+}
